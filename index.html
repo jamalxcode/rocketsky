@@ -1,0 +1,638 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Missile Command</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=IBM+Plex+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one arcade screen, 4:3, centered and scaled to the window; a slim control strip beneath it. Single dark theme by choice. */
+:root{
+  --bg:#07060b; --frame:#221c2e; --text:#d6cfe6; --dim:#8a819e; --accent:#ffd800;
+  --pixel:'Press Start 2P', ui-monospace, 'Courier New', monospace;
+  --mono:'IBM Plex Mono', ui-monospace, Consolas, monospace;
+  color-scheme:dark;
+}
+html,body{height:100%}
+body{background:var(--bg);color:var(--text);font-family:var(--mono);display:flex;align-items:center;justify-content:center;padding-inline:16px;padding-block:12px;box-sizing:border-box;overflow:hidden}
+.cab{width:min(100%, calc((100vh - 90px) * 4 / 3));width:min(100%, calc((100dvh - 90px) * 4 / 3));display:flex;flex-direction:column;gap:10px}
+.screen{position:relative;aspect-ratio:4/3;max-width:100%;border-radius:14px;overflow:hidden;background:#000;box-shadow:0 0 0 2px var(--frame),0 0 0 8px #0d0b13,0 0 60px rgba(255,216,0,.07)}
+canvas{display:block;width:100%;height:100%;image-rendering:crisp-edges;image-rendering:pixelated;cursor:none;touch-action:none}
+.screen::after{content:"";position:absolute;inset:0;pointer-events:none;background:repeating-linear-gradient(to bottom,rgba(0,0,0,0) 0 2px,rgba(0,0,0,.22) 2px 3px);box-shadow:inset 0 0 70px rgba(0,0,0,.6)}
+.bar{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px 16px;font-size:12px;color:var(--dim)}
+.bar b{color:var(--text);font-weight:600}
+.keys{min-width:0}
+.btns{display:flex;gap:8px}
+button{font-family:var(--pixel);font-size:9px;letter-spacing:.06em;text-transform:uppercase;background:transparent;color:var(--accent);border:1px solid #4a3f12;border-radius:6px;padding:8px 10px;cursor:pointer}
+button:hover{border-color:var(--accent)}
+button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+</style>
+</head>
+<body>
+
+<main class="cab">
+  <div class="screen"><canvas id="game" aria-label="Missile Command game screen"></canvas></div>
+  <div class="bar">
+    <span class="keys"><b>Mouse / tap</b> aim and fire · <b>A S D</b> fire left / center / right · <b>P</b> pause · <b>M</b> sound</span>
+    <div class="btns">
+      <button id="pauseBtn" type="button">Pause</button>
+      <button id="soundBtn" type="button" aria-pressed="true">Sound on</button>
+    </div>
+  </div>
+</main>
+
+<script>
+(() => {
+const cv = document.getElementById('game'), g = cv.getContext('2d');
+const W = 320, H = 240, GROUND = 224, MOUND = 210, MAX_R = 13;
+cv.width = W; cv.height = H;
+const RM = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+const BASE_X = [24, 160, 296];
+const CITY_X = [56, 82, 108, 212, 238, 264];
+
+// Palettes change every two waves, as in the arcade original.
+const PALETTES = [
+  {bg:'#000000',ground:'#e0c000',enemy:'#ff2a2a',player:'#4a7bff',city:'#38c8ff',city2:'#1e5ad8',ammo:'#2440d8',text:'#ff2a2a'},
+  {bg:'#000000',ground:'#3a6bff',enemy:'#e0c000',player:'#ff2a2a',city:'#ffffff',city2:'#38c8ff',ammo:'#ffe000',text:'#e0c000'},
+  {bg:'#081040',ground:'#ff8a00',enemy:'#ffffff',player:'#ffe000',city:'#ff40ff',city2:'#a020c0',ammo:'#081040',text:'#ffffff'},
+  {bg:'#000000',ground:'#20d040',enemy:'#ff40ff',player:'#38c8ff',city:'#ffe000',city2:'#ff8a00',ammo:'#003a10',text:'#20d040'},
+  {bg:'#300010',ground:'#38c8ff',enemy:'#20ff60',player:'#ffffff',city:'#ff2a2a',city2:'#ffe000',ammo:'#300010',text:'#20ff60'},
+  {bg:'#000000',ground:'#ff2a2a',enemy:'#38c8ff',player:'#ffe000',city:'#20d040',city2:'#1e8a30',ammo:'#ffe000',text:'#38c8ff'},
+  {bg:'#102010',ground:'#a020c0',enemy:'#ffe000',player:'#ff2a2a',city:'#38c8ff',city2:'#ffffff',ammo:'#ffe000',text:'#ffe000'},
+];
+const BOOM = ['#ffffff','#ffe000','#ff40ff','#38c8ff','#ff2a2a','#4a7bff','#20ff60'];
+
+const CITY_SPR = [
+  "......1........",
+  "......1...1....",
+  "..1..121..1....",
+  "..1..121.121.1.",
+  ".121.121.121.1.",
+  ".1211212112121.",
+  "121212121212121",
+  "222222222222222",
+];
+const RUBBLE_SPR = [
+  "..2....1....2..",
+  ".212..121..212.",
+  "222222222222222",
+];
+const PLANE_SPR = [
+  "....#......",
+  "...##......",
+  "###########",
+  "...##....##",
+  "....#......",
+];
+const SAT_SPR = [
+  "#.#.....#.#",
+  "###..#..###",
+  "#.#######.#",
+  "###..#..###",
+  "#.#.....#.#",
+];
+
+/* ---------- Sound: all synthesized with Web Audio ---------- */
+const sfx = (() => {
+  let ac = null, master = null, nb = null, hum = null, lastBoom = 0, muted = false;
+  function init() {
+    if (ac) { if (ac.state === 'suspended') ac.resume(); return; }
+    try { ac = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { return; }
+    master = ac.createGain(); master.gain.value = muted ? 0 : 0.5;
+    const comp = ac.createDynamicsCompressor();
+    master.connect(comp); comp.connect(ac.destination);
+    nb = ac.createBuffer(1, ac.sampleRate * 2, ac.sampleRate);
+    const d = nb.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  }
+  function noise({dur, f0, f1, type = 'lowpass', q = 1, vol = .5, delay = 0}) {
+    if (!ac) return;
+    const t = ac.currentTime + delay;
+    const s = ac.createBufferSource(); s.buffer = nb; s.loop = true;
+    const f = ac.createBiquadFilter(); f.type = type; f.Q.value = q;
+    f.frequency.setValueAtTime(f0, t); f.frequency.exponentialRampToValueAtTime(f1, t + dur);
+    const gn = ac.createGain();
+    gn.gain.setValueAtTime(0.0001, t); gn.gain.exponentialRampToValueAtTime(vol, t + 0.01);
+    gn.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    s.connect(f); f.connect(gn); gn.connect(master);
+    s.start(t, Math.random()); s.stop(t + dur + 0.05);
+  }
+  function tone({f0, f1 = f0, dur, type = 'square', vol = .15, delay = 0}) {
+    if (!ac) return;
+    const t = ac.currentTime + delay;
+    const o = ac.createOscillator(); o.type = type;
+    o.frequency.setValueAtTime(f0, t); o.frequency.exponentialRampToValueAtTime(f1, t + dur);
+    const gn = ac.createGain();
+    gn.gain.setValueAtTime(0.0001, t); gn.gain.exponentialRampToValueAtTime(vol, t + 0.005);
+    gn.gain.setValueAtTime(vol, t + dur * 0.6); gn.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(gn); gn.connect(master); o.start(t); o.stop(t + dur + 0.02);
+  }
+  return {
+    init,
+    toggle() { muted = !muted; if (master) master.gain.value = muted ? 0 : 0.5; return muted; },
+    launch() { noise({dur:.3, f0:400, f1:3200, type:'bandpass', q:1.5, vol:.4}); tone({f0:1600, f1:350, dur:.12, vol:.04}); },
+    explode() {
+      if (!ac || ac.currentTime - lastBoom < .05) return; lastBoom = ac.currentTime;
+      noise({dur:.8, f0:2600, f1:70, vol:.6}); tone({f0:130, f1:35, dur:.5, type:'sine', vol:.4});
+    },
+    cityHit() {
+      noise({dur:1.5, f0:1400, f1:40, vol:.95}); tone({f0:85, f1:24, dur:1.1, type:'sine', vol:.7});
+      tone({f0:220, f1:40, dur:.6, type:'sawtooth', vol:.1});
+    },
+    empty() { tone({f0:150, f1:90, dur:.09, vol:.12}); },
+    siren() { for (let i = 0; i < 8; i++) tone({f0: i % 2 ? 622 : 932, dur:.15, vol:.1, delay:i * .18}); },
+    tick() { tone({f0:1700, dur:.035, vol:.08}); },
+    cityTick() { tone({f0:480, f1:240, dur:.2, vol:.12}); tone({f0:720, f1:360, dur:.2, type:'triangle', vol:.07}); },
+    bonusCity() { [523, 659, 784, 1047, 1319, 1568].forEach((f, i) => tone({f0:f, dur:.14, vol:.11, delay:i * .085})); },
+    smart() { tone({f0:2200, f1:500, dur:.3, type:'triangle', vol:.09}); },
+    theEnd() {
+      noise({dur:4.5, f0:3500, f1:30, vol:1}); tone({f0:90, f1:18, dur:4, type:'sine', vol:.85});
+      noise({dur:3, f0:900, f1:50, vol:.7, delay:.7});
+    },
+    hum(on) {
+      if (!ac) return;
+      if (on && !hum) {
+        const o = ac.createOscillator(); o.type = 'sawtooth'; o.frequency.value = 95;
+        const lfo = ac.createOscillator(); lfo.frequency.value = 12;
+        const lg = ac.createGain(); lg.gain.value = 35; lfo.connect(lg); lg.connect(o.frequency);
+        const f = ac.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = 1000;
+        const gn = ac.createGain(); gn.gain.value = 0; gn.gain.setTargetAtTime(.07, ac.currentTime, .05);
+        o.connect(f); f.connect(gn); gn.connect(master); o.start(); lfo.start();
+        hum = {o, lfo, gn};
+      } else if (!on && hum) {
+        const h = hum; hum = null;
+        h.gn.gain.setTargetAtTime(0, ac.currentTime, .05);
+        h.o.stop(ac.currentTime + .3); h.lfo.stop(ac.currentTime + .3);
+      }
+    },
+  };
+})();
+
+/* ---------- Game state ---------- */
+let state = 'title', wave = 1, score = 0, hi = loadHi(), nextBonus = 10000, bonusCities = 0;
+let bases = BASE_X.map(x => ({x, ammo:10, dead:false}));
+let cities = CITY_X.map(x => ({x, alive:true}));
+let enemies = [], pm = [], booms = [], flyers = [], smarts = [];
+let cfg, toSpawn = 0, smartToSpawn = 0, flyersToSpawn = 0, spawnT = 0, flyerT = 0;
+let frame = 0, flashT = 0, stateT = 0, tally = null, paused = false;
+const cursor = {x:160, y:120};
+
+function loadHi() { try { return +localStorage.getItem('mc-hi') || 7500; } catch (e) { return 7500; } }
+function saveHi() { try { localStorage.setItem('mc-hi', String(hi)); } catch (e) {} }
+const mult = () => Math.min(6, Math.ceil(wave / 2));
+const pal = () => PALETTES[Math.floor((wave - 1) / 2) % PALETTES.length];
+const rnd = (a, b) => a + Math.random() * (b - a);
+
+function waveCfg(w) {
+  return {
+    count: Math.min(10 + w * 2, 30),
+    speed: Math.min(16 + w * 4, 72),
+    mirv: w < 2 ? 0 : Math.min(.1 + w * .03, .35),
+    flyers: w < 2 ? 0 : Math.min(1 + Math.floor(w / 2), 4),
+    smart: w < 6 ? 0 : Math.min(w - 5, 6),
+    maxActive: Math.min(4 + w, 10),
+  };
+}
+
+function addScore(n) {
+  score += n;
+  while (score >= nextBonus) { bonusCities++; nextBonus += 10000; }
+  if (score > hi) hi = score;
+}
+
+function newGame() {
+  score = 0; wave = 1; nextBonus = 10000; bonusCities = 0;
+  cities = CITY_X.map(x => ({x, alive:true}));
+  startWave();
+}
+function startWave() {
+  bases = BASE_X.map(x => ({x, ammo:10, dead:false}));
+  enemies = []; pm = []; booms = []; flyers = []; smarts = [];
+  cfg = waveCfg(wave);
+  toSpawn = cfg.count; smartToSpawn = cfg.smart; flyersToSpawn = cfg.flyers;
+  spawnT = .5; flyerT = rnd(4, 9);
+  state = 'intro'; stateT = 0;
+  sfx.siren();
+}
+
+function pickTarget() {
+  if (Math.random() < .3) return {x: BASE_X[Math.floor(Math.random() * 3)], y: MOUND + 1};
+  const alive = cities.filter(c => c.alive);
+  const pool = alive.length && Math.random() < .8 ? alive : cities;
+  const c = pool[Math.floor(Math.random() * pool.length)];
+  return {x: c.x, y: GROUND - 2};
+}
+function spawnEnemy(sx, sy, canSplit) {
+  const t = pickTarget(), dx = t.x - sx, dy = t.y - sy, d = Math.hypot(dx, dy);
+  enemies.push({sx, sy, x:sx, y:sy, tx:t.x, ty:t.y, vx:dx / d, vy:dy / d,
+    mirv: canSplit && Math.random() < cfg.mirv, splitY: rnd(60, 140)});
+}
+function spawnSmart() {
+  const t = pickTarget();
+  smarts.push({x: rnd(10, W - 10), y: 12, tx: t.x, ty: t.y});
+  sfx.smart();
+}
+function spawnFlyer() {
+  const left = Math.random() < .5;
+  flyers.push({type: Math.random() < .5 ? 'plane' : 'sat', x: left ? -12 : W + 12, y: rnd(60, 120),
+    vx: (left ? 1 : -1) * (22 + wave * 1.5), drops: 2, dropT: rnd(1, 3)});
+}
+function addBoom(x, y) { booms.push({x, y, t:0, seed: Math.floor(Math.random() * 7)}); }
+function boomR(b) {
+  if (b.t < .4) return MAX_R * b.t / .4;
+  if (b.t < .65) return MAX_R;
+  return Math.max(0, MAX_R * (1 - (b.t - .65) / .4));
+}
+
+function impact(x, y) {
+  addBoom(x, y);
+  let hit = false;
+  for (const c of cities) if (c.alive && Math.abs(c.x - x) < 9) { c.alive = false; hit = true; }
+  for (const b of bases) if (!b.dead && Math.abs(b.x - x) < 12 && y > MOUND - 4) { b.dead = true; b.ammo = 0; hit = true; }
+  if (hit) { if (!RM) flashT = .22; sfx.cityHit(); } else sfx.explode();
+}
+
+/* ---------- Firing ---------- */
+function fire(i) {
+  if (state !== 'play' || paused) return;
+  const b = bases[i];
+  if (b.dead || b.ammo <= 0 || pm.length >= 8) { sfx.empty(); return; }
+  b.ammo--;
+  const tx = cursor.x, ty = Math.min(cursor.y, MOUND - 12);
+  pm.push({x:b.x, y:MOUND - 1, sx:b.x, sy:MOUND - 1, tx, ty, speed: i === 1 ? 320 : 200});
+  sfx.launch();
+}
+function fireNearest() {
+  const order = [0, 1, 2].filter(i => !bases[i].dead && bases[i].ammo > 0)
+    .sort((a, b) => Math.abs(bases[a].x - cursor.x) - Math.abs(bases[b].x - cursor.x));
+  if (order.length) fire(order[0]); else sfx.empty();
+}
+
+/* ---------- Update ---------- */
+function updatePlay(dt) {
+  const allOut = bases.every(b => b.dead || b.ammo === 0) && pm.length === 0;
+  const boost = allOut ? 4 : 1, sp = cfg.speed * boost;
+
+  spawnT -= dt * boost;
+  if (spawnT <= 0 && (toSpawn > 0 || smartToSpawn > 0) && enemies.length + smarts.length < cfg.maxActive) {
+    const n = 1 + Math.floor(Math.random() * Math.min(4, toSpawn + smartToSpawn));
+    for (let i = 0; i < n; i++) {
+      if (smartToSpawn > 0 && (toSpawn === 0 || Math.random() < .3)) { smartToSpawn--; spawnSmart(); }
+      else if (toSpawn > 0) { toSpawn--; spawnEnemy(rnd(8, W - 8), 12, true); }
+    }
+    spawnT = Math.max(.8, 3.2 - wave * .15) * rnd(.6, 1.4);
+  }
+  if (toSpawn === 0 && smartToSpawn === 0) flyersToSpawn = 0;
+  flyerT -= dt;
+  if (flyerT <= 0 && flyersToSpawn > 0) { flyersToSpawn--; spawnFlyer(); flyerT = rnd(6, 12); }
+
+  // Player missiles
+  for (const p of pm) {
+    const dx = p.tx - p.x, dy = p.ty - p.y, d = Math.hypot(dx, dy), step = p.speed * dt;
+    if (d <= step) { p.dead = true; addBoom(p.tx, p.ty); sfx.explode(); }
+    else { p.x += dx / d * step; p.y += dy / d * step; }
+  }
+  // Enemy missiles (array may grow while iterating, from MIRV splits)
+  for (let i = 0; i < enemies.length; i++) {
+    const e = enemies[i];
+    if (e.dead) continue;
+    e.x += e.vx * sp * dt; e.y += e.vy * sp * dt;
+    if (e.mirv && !e.split && e.y >= e.splitY) {
+      e.split = true;
+      const k = 1 + Math.floor(Math.random() * 2);
+      for (let j = 0; j < k; j++) spawnEnemy(e.x, e.y, false);
+    }
+    if (e.y >= e.ty) { e.dead = true; impact(e.tx, e.ty); }
+  }
+  // Smart bombs steer around explosions
+  for (const s of smarts) {
+    let vx = s.tx - s.x, vy = s.ty - s.y, d = Math.hypot(vx, vy) || 1;
+    vx /= d; vy /= d;
+    for (const b of booms) {
+      const r = boomR(b), dx = s.x - b.x, dy = s.y - b.y, bd = Math.hypot(dx, dy);
+      if (bd > 0 && bd < r + 14) { vx += dx / bd * 2.2; vy += dy / bd * 2.2; }
+    }
+    d = Math.hypot(vx, vy) || 1;
+    s.x = Math.max(4, Math.min(W - 4, s.x + vx / d * sp * 1.1 * dt));
+    s.y = Math.max(10, s.y + vy / d * sp * 1.1 * dt);
+    if (s.y >= s.ty - 1) { s.dead = true; impact(s.tx, s.ty); }
+  }
+  // Bombers and satellites
+  for (const f of flyers) {
+    f.x += f.vx * dt; f.dropT -= dt;
+    if (f.dropT <= 0 && f.drops > 0 && f.x > 12 && f.x < W - 12) {
+      f.drops--; f.dropT = rnd(2, 4); spawnEnemy(f.x, f.y + 3, false);
+    }
+    if (f.x < -16 || f.x > W + 16) f.dead = true;
+  }
+  updateBooms(dt);
+
+  enemies = enemies.filter(e => !e.dead); pm = pm.filter(p => !p.dead);
+  smarts = smarts.filter(s => !s.dead); flyers = flyers.filter(f => !f.dead);
+
+  if (!toSpawn && !smartToSpawn && !flyersToSpawn && !enemies.length && !smarts.length &&
+      !flyers.length && !booms.length && !pm.length) startTally();
+}
+
+function updateBooms(dt) {
+  for (let i = 0; i < booms.length; i++) {
+    const b = booms[i], r = boomR(b);
+    b.t += dt;
+    if (r <= 0) continue;
+    const r2 = r * r;
+    for (const e of enemies) if (!e.dead && (e.x - b.x) ** 2 + (e.y - b.y) ** 2 < r2) {
+      e.dead = true; addBoom(e.x, e.y); addScore(25 * mult()); sfx.explode();
+    }
+    for (const s of smarts) if (!s.dead && (s.x - b.x) ** 2 + (s.y - b.y) ** 2 < r2) {
+      s.dead = true; addBoom(s.x, s.y); addScore(125 * mult()); sfx.explode();
+    }
+    for (const f of flyers) if (!f.dead && (f.x - b.x) ** 2 + (f.y - b.y) ** 2 < (r + 4) ** 2) {
+      f.dead = true; addBoom(f.x, f.y); addScore(100 * mult()); sfx.explode();
+    }
+  }
+  booms = booms.filter(b => b.t < 1.05);
+}
+
+function startTally() {
+  state = 'tally'; stateT = 0;
+  tally = {phase:'ammo', t:.8, ammo:0, ammoPts:0, cityN:0, cityPts:0, idx:0, bonusMsg:0};
+}
+function updateTally(dt) {
+  tally.t -= dt;
+  if (tally.t > 0) return;
+  if (tally.phase === 'ammo') {
+    const b = bases.find(b => !b.dead && b.ammo > 0);
+    if (b) { b.ammo--; tally.ammo++; tally.ammoPts += 5 * mult(); addScore(5 * mult()); sfx.tick(); tally.t = .06; }
+    else { tally.phase = 'cities'; tally.t = .5; }
+  } else if (tally.phase === 'cities') {
+    let i = tally.idx;
+    while (i < cities.length && !cities[i].alive) i++;
+    if (i < cities.length) {
+      tally.idx = i + 1; tally.cityN++; tally.cityPts += 100 * mult(); addScore(100 * mult());
+      sfx.cityTick(); tally.t = .32;
+    } else { tally.phase = 'bonus'; tally.t = .8; }
+  } else if (tally.phase === 'bonus') {
+    const dead = cities.filter(c => !c.alive);
+    if (bonusCities > 0 && dead.length) {
+      dead[Math.floor(Math.random() * dead.length)].alive = true;
+      bonusCities--; tally.bonusMsg = 1; sfx.bonusCity(); tally.t = 1.3;
+    } else { tally.phase = 'end'; tally.t = 1; }
+  } else {
+    if (!cities.some(c => c.alive)) { state = 'theend'; stateT = 0; saveHi(); sfx.theEnd(); }
+    else { wave++; startWave(); }
+  }
+}
+
+function update(dt) {
+  stateT += dt;
+  flashT = Math.max(0, flashT - dt);
+  if (state === 'intro' && stateT > 2.8) { state = 'play'; stateT = 0; }
+  else if (state === 'play') updatePlay(dt);
+  else if (state === 'tally') updateTally(dt);
+}
+
+/* ---------- Drawing ---------- */
+function line(x0, y0, x1, y1) {
+  x0 = Math.round(x0); y0 = Math.round(y0); x1 = Math.round(x1); y1 = Math.round(y1);
+  const dx = Math.abs(x1 - x0), dy = -Math.abs(y1 - y0), sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+  let err = dx + dy;
+  for (let n = 0; n < 2000; n++) {
+    g.fillRect(x0, y0, 1, 1);
+    if (x0 === x1 && y0 === y1) break;
+    const e2 = 2 * err;
+    if (e2 >= dy) { err += dy; x0 += sx; }
+    if (e2 <= dx) { err += dx; y0 += sy; }
+  }
+}
+function disc(cx, cy, r) {
+  cx = Math.round(cx); cy = Math.round(cy);
+  for (let dy = -Math.floor(r); dy <= r; dy++) {
+    const w = Math.floor(Math.sqrt(r * r - dy * dy));
+    g.fillRect(cx - w, cy + dy, w * 2 + 1, 1);
+  }
+}
+function sprite(rows, x, y, colors, flip) {
+  x = Math.round(x); y = Math.round(y);
+  rows.forEach((r, j) => {
+    for (let i = 0; i < r.length; i++) {
+      const ch = r[flip ? r.length - 1 - i : i];
+      if (ch !== '.') { g.fillStyle = colors[ch]; g.fillRect(x + i, y + j, 1, 1); }
+    }
+  });
+}
+function text(s, x, y, c, size = 8, align = 'center') {
+  g.font = size + 'px "Press Start 2P", monospace';
+  g.textAlign = align; g.textBaseline = 'top'; g.fillStyle = c;
+  g.fillText(s, x, y);
+}
+const cyc = (k = 0) => BOOM[((RM ? frame >> 3 : frame >> 1) + k) % BOOM.length];
+const AMMO_POS = [];
+for (let r = 0; r < 4; r++) for (let i = 0; i <= r; i++) AMMO_POS.push([Math.round((i - r / 2) * 4), MOUND + 2 + r * 3]);
+
+function drawScene(p, showAmmoLabels) {
+  g.fillStyle = flashT > 0 ? ((frame >> 1) & 1 ? '#ffffff' : p.enemy) : p.bg;
+  g.fillRect(0, 0, W, H);
+  g.fillStyle = p.ground;
+  g.fillRect(0, GROUND, W, H - GROUND);
+  for (const bx of BASE_X) for (let y = MOUND; y < GROUND; y++) {
+    const half = Math.round(10 + (y - MOUND) * 8 / 14);
+    g.fillRect(bx - half, y, half * 2, 1);
+  }
+  for (const b of bases) {
+    g.fillStyle = p.ammo;
+    for (let k = 10 - b.ammo; k < 10; k++) { const [ox, oy] = AMMO_POS[k]; g.fillRect(b.x + ox - 1, oy, 2, 2); }
+    if (showAmmoLabels) {
+      if (b.dead || b.ammo === 0) text('OUT', b.x, GROUND + 5, p.bg);
+      else if (b.ammo <= 3) text('LOW', b.x, GROUND + 5, p.bg);
+    }
+  }
+  for (const c of cities) {
+    if (c.alive) sprite(CITY_SPR, c.x - 7, GROUND - 8, {'1':p.city, '2':p.city2});
+    else sprite(RUBBLE_SPR, c.x - 7, GROUND - 3, {'1':p.city2, '2':p.city2});
+  }
+}
+
+function drawActors(p) {
+  g.fillStyle = p.enemy;
+  for (const e of enemies) line(e.sx, e.sy, e.x, e.y);
+  g.fillStyle = (frame >> 2) & 1 ? '#ffffff' : p.enemy;
+  for (const e of enemies) g.fillRect(Math.round(e.x), Math.round(e.y), 1, 1);
+
+  g.fillStyle = p.player;
+  for (const m of pm) line(m.sx, m.sy, m.x, m.y);
+  for (const m of pm) {
+    g.fillStyle = '#ffffff'; g.fillRect(Math.round(m.x), Math.round(m.y), 1, 1);
+    if ((frame >> 2) & 1) {
+      g.fillStyle = p.player;
+      const tx = Math.round(m.tx), ty = Math.round(m.ty);
+      for (let k = -2; k <= 2; k++) { g.fillRect(tx + k, ty + k, 1, 1); g.fillRect(tx + k, ty - k, 1, 1); }
+    }
+  }
+  for (const s of smarts) {
+    const c = (frame >> 2) & 1 ? '#ffffff' : p.enemy, x = Math.round(s.x), y = Math.round(s.y);
+    g.fillStyle = c;
+    g.fillRect(x, y - 2, 1, 5); g.fillRect(x - 2, y, 5, 1); g.fillRect(x - 1, y - 1, 3, 3);
+    g.fillStyle = p.bg; g.fillRect(x, y, 1, 1);
+  }
+  for (const f of flyers) {
+    const spr = f.type === 'plane' ? PLANE_SPR : SAT_SPR;
+    sprite(spr, f.x - 5, f.y - 2, {'#': f.type === 'plane' ? p.city : ((frame >> 3) & 1 ? '#ffffff' : p.city)}, f.vx < 0);
+  }
+  for (const b of booms) {
+    const r = boomR(b);
+    if (r <= 0) continue;
+    g.fillStyle = cyc(b.seed); disc(b.x, b.y, r);
+  }
+}
+
+function drawCrosshair(p) {
+  const x = Math.round(cursor.x), y = Math.round(cursor.y);
+  g.fillStyle = p.player;
+  g.fillRect(x - 4, y, 3, 1); g.fillRect(x + 2, y, 3, 1);
+  g.fillRect(x, y - 4, 1, 3); g.fillRect(x, y + 2, 1, 3);
+  g.fillStyle = '#ffffff'; g.fillRect(x, y, 1, 1);
+}
+
+function drawHud(p) {
+  text(String(score), 70, 3, p.text);
+  text(String(hi), 160, 3, p.text);
+  if (bonusCities > 0) {
+    for (let i = 0; i < Math.min(bonusCities, 5); i++) {
+      g.fillStyle = p.city; g.fillRect(232 + i * 6, 5, 4, 4);
+    }
+  }
+}
+
+function drawOctagon(cx, cy, r) {
+  g.beginPath();
+  for (let i = 0; i < 8; i++) {
+    const a = Math.PI / 8 + i * Math.PI / 4;
+    g.lineTo(cx + Math.cos(a) * r, cy + Math.sin(a) * r);
+  }
+  g.closePath(); g.fill();
+}
+
+function draw() {
+  const p = state === 'title' ? PALETTES[0] : pal();
+
+  if (state === 'theend') {
+    drawScene(p, false);
+    const R = Math.min(stateT * 150, 260);
+    const settle = stateT > 2.6;
+    for (let k = 0; k < 8; k++) {
+      const r = R - k * 16;
+      if (r <= 0) break;
+      g.fillStyle = settle ? (k % 2 ? '#ff2a2a' : '#ffe000') : cyc(k);
+      drawOctagon(160, 120, r);
+    }
+    if (stateT > 1.4) text('THE END', 160, 108, settle ? '#ff2a2a' : '#000000', 16);
+    if (stateT > 3.2) {
+      g.fillStyle = '#000000'; g.fillRect(70, 140, 180, 40);
+      text('FINAL SCORE ' + score, 160, 146, '#ffe000');
+      if ((frame >> 5) & 1) text('CLICK TO PLAY AGAIN', 160, 162, '#ffffff');
+    }
+    return;
+  }
+
+  drawScene(p, state === 'play');
+
+  if (state === 'title') {
+    text('MISSILE', 160, 44, cyc(0), 16);
+    text('COMMAND', 160, 66, cyc(3), 16);
+    if ((frame >> 5) & 1 || RM) text('CLICK OR TAP TO START', 160, 104, '#ffffff');
+    text('AIM, THEN CLICK TO FIRE', 160, 128, p.player);
+    text('A S D  FIRE LEFT/CENTER/RIGHT', 160, 142, p.player);
+    text('CENTER BASE FIRES FASTEST', 160, 156, p.player);
+    text('HIGH SCORE ' + hi, 160, 180, p.enemy);
+    return;
+  }
+
+  drawActors(p);
+  drawHud(p);
+
+  if (state === 'intro') {
+    text('WAVE ' + wave, 160, 48, p.text);
+    text('PLAYER 1', 160, 72, p.player);
+    text('DEFEND', 96, 100, p.player); text('CITIES', 236, 100, p.player);
+    text(mult() + ' X POINTS', 160, 128, p.player);
+    if ((frame >> 4) & 1) {
+      g.fillStyle = p.player;
+      for (const c of cities) if (c.alive) {
+        g.fillRect(c.x, 194, 1, 12);
+        for (let k = 1; k <= 3; k++) g.fillRect(c.x - k, 206 - k, k * 2 + 1, 1);
+      }
+    }
+  } else if (state === 'tally') {
+    text('BONUS POINTS', 160, 70, p.text);
+    text(String(tally.ammoPts), 100, 96, p.text, 8, 'right');
+    g.fillStyle = p.player;
+    for (let i = 0; i < tally.ammo; i++) g.fillRect(110 + i * 5, 96, 2, 6);
+    text(String(tally.cityPts), 100, 118, p.text, 8, 'right');
+    for (let i = 0; i < tally.cityN; i++) sprite(CITY_SPR, 110 + i * 18, 116, {'1':p.city, '2':p.city2});
+    if (tally.bonusMsg && (frame >> 3) & 1) text('BONUS CITY', 160, 148, p.player);
+  } else if (state === 'play') {
+    drawCrosshair(p);
+  }
+
+  if (paused) {
+    g.fillStyle = 'rgba(0,0,0,.6)'; g.fillRect(0, 100, W, 36);
+    text('PAUSED', 160, 108, '#ffffff', 16);
+  }
+}
+
+/* ---------- Loop & input ---------- */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(.05, (now - lastT) / 1000); lastT = now; frame++;
+  if (!paused) update(dt);
+  sfx.hum(!paused && state === 'play' && flyers.length > 0);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+function toCanvas(e) {
+  const r = cv.getBoundingClientRect();
+  cursor.x = Math.max(2, Math.min(W - 3, (e.clientX - r.left) / r.width * W));
+  cursor.y = Math.max(14, Math.min(MOUND - 12, (e.clientY - r.top) / r.height * H));
+}
+function primary() {
+  sfx.init();
+  if (state === 'title') newGame();
+  else if (state === 'theend') { if (stateT > 3.2) newGame(); }
+  else if (paused) setPaused(false);
+  else fireNearest();
+}
+cv.addEventListener('pointermove', toCanvas);
+cv.addEventListener('pointerdown', e => { e.preventDefault(); toCanvas(e); primary(); });
+cv.addEventListener('contextmenu', e => e.preventDefault());
+
+const pauseBtn = document.getElementById('pauseBtn'), soundBtn = document.getElementById('soundBtn');
+function setPaused(v) {
+  if (!['intro', 'play', 'tally'].includes(state)) v = false;
+  paused = v; pauseBtn.textContent = paused ? 'Resume' : 'Pause';
+}
+function toggleSound() {
+  sfx.init();
+  const m = sfx.toggle();
+  soundBtn.textContent = m ? 'Sound off' : 'Sound on';
+  soundBtn.setAttribute('aria-pressed', String(!m));
+}
+pauseBtn.addEventListener('click', () => setPaused(!paused));
+soundBtn.addEventListener('click', toggleSound);
+document.addEventListener('visibilitychange', () => { if (document.hidden) setPaused(true); });
+
+const FIRE_KEYS = {KeyA:0, Digit1:0, KeyZ:0, KeyS:1, Digit2:1, KeyX:1, KeyD:2, Digit3:2, KeyC:2};
+addEventListener('keydown', e => {
+  if (e.target.tagName === 'BUTTON' && (e.code === 'Space' || e.code === 'Enter')) return;
+  sfx.init();
+  if (e.code in FIRE_KEYS) { e.preventDefault(); if (!paused) fire(FIRE_KEYS[e.code]); }
+  else if (e.code === 'Space' || e.code === 'Enter') { e.preventDefault(); primary(); }
+  else if (e.code === 'KeyP' || e.code === 'Escape') setPaused(!paused);
+  else if (e.code === 'KeyM') toggleSound();
+});
+})();
+</script>
+</body>
+</html>
